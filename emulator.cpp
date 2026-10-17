@@ -20,10 +20,7 @@
 
 const bool ENABLE_PRINT_FILES = ENABLE_PRINT_FILES_FLAG;
 
-// TO DO: "Declare 4 cores for the CPU scheduler."
 const int NUM_CORES = 4;
-
-// TO DO: "Create 10 processes, each with 100 print commands, upon the start of your OS emulator."
 
 // timestamp used by Process and the print records, ex: 08/06/2024 09:15:22AM
 std::string getTimestamp()
@@ -76,19 +73,12 @@ std::atomic<bool> emulatorRunning{true}; // set to false on exit
 std::vector<std::shared_ptr<Process>> coreAssignments(NUM_CORES, nullptr);
 std::mutex coreMutex;
 
-// TO DO: "Implement the "print" command with the following behavior: each process creates a text file
-// where all its associated print commands are written, with the timestamp of when it was executed by
-// the CPU and the CPU core that executed it."
-// TO DO: "Thus, if there are 10 processes, 10 text files should be created."
 void writePrintRecord(const std::string &pid, int core, int cmdNum)
 {
     if (!ENABLE_PRINT_FILES)
         return; // files disabled for the xmachine project
 
-    // TO DO: open <pid>_output.txt and write the timestamp, core and command number
-
     std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"Hello world from " + pid + "!\"";
-
     std::lock_guard<std::mutex> lock(fileMutex);
 
     auto it = processFiles.find(pid);
@@ -104,11 +94,9 @@ void writePrintRecord(const std::string &pid, int core, int cmdNum)
     it->second << line << "\n";
 }
 
-// TO DO: "implement a first-come-first-serve (FCFS) scheduler, emphasizing the multi-threaded approach
-// (e.g., 1 thread for the scheduler, 1 thread per CPU worker)"
 void workerThread(int coreId)
 {
-    // TO DO: 1 thread per CPU worker
+    // 1 thread per CPU worker
     while (emulatorRunning)
     {
         std::shared_ptr<Process> currentProc = nullptr;
@@ -222,8 +210,6 @@ void schedulerThread()
     }
 }
 
-// TO DO: "Periodically type the "screen -ls" command every 1 - 2 seconds until all processes are shown
-// in the "finished processes" list."
 void cmdScreenLs()
 {
     std::cout << "----------------------------------------\n";
@@ -263,7 +249,7 @@ void shutdownEmulator()
 
 int main()
 {
-    std::vector<std::thread> workers; // TO DO: start the worker threads here
+    std::vector<std::thread> workers; // start the worker threads 
     for (int i = 0; i < NUM_CORES; ++i)
     {
         workers.emplace_back(workerThread, i);
@@ -271,7 +257,7 @@ int main()
 
     std::thread scheduler(schedulerThread);
 
-    // TO DO: create the 10 processes and push them to the ready queue
+    // Create the 10 processes and push them to the ready queue
     for (int i = 1; i <= 10; ++i)
     {
         std::ostringstream name;
