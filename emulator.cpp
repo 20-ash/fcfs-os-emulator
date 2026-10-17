@@ -83,9 +83,25 @@ std::mutex coreMutex;
 void writePrintRecord(const std::string &pid, int core, int cmdNum)
 {
     if (!ENABLE_PRINT_FILES)
-        return; // files disabled for the machine project
+        return; // files disabled for the xmachine project
 
     // TO DO: open <pid>_output.txt and write the timestamp, core and command number
+
+    std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"Hello world from " + pid + "!\"";
+
+    std::lock_guard<std::mutex> lock(fileMutex);
+
+    auto it = processFiles.find(pid);
+    if (it == processFiles.end())
+    {
+        std::ofstream f(pid + "_output.txt", std::ios::out | std::ios::trunc);
+        if (!f.is_open())
+            return;
+        f << "Process name: " << pid << "\nLogs:\n\n";
+        it = processFiles.emplace(pid, std::move(f)).first;
+    }
+
+    it->second << line << "\n";
 }
 
 // TO DO: "implement a first-come-first-serve (FCFS) scheduler, emphasizing the multi-threaded approach
@@ -256,6 +272,14 @@ int main()
     std::thread scheduler(schedulerThread);
 
     // TO DO: create the 10 processes and push them to the ready queue
+    for (int i = 1; i <= 10; ++i)
+    {
+        std::ostringstream name;
+        name << "process" << std::setw(2) << std::setfill('0') << i;
+
+        std::lock_guard<std::mutex> lock(queueMutex);
+        readyQueue.push(std::make_shared<Process>(name.str(), 100));
+    }
 
     std::cout << "> ";
     std::string input;
