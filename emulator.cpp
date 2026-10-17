@@ -257,6 +257,7 @@ int main()
 
     // TO DO: create the 10 processes and push them to the ready queue
 
+    std::cout << "> ";
     std::string input;
     while (emulatorRunning && std::getline(std::cin, input))
     {
