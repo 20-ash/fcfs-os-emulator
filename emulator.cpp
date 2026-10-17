@@ -82,7 +82,8 @@ void writePrintRecord(const std::string &pid, int core, int cmdNum)
         it = processFiles.emplace(pid, std::move(f)).first;
     }
 
-    it->second << line << "\n";
+    it->second << line << "\n"
+               << std::flush;
 }
 
 void workerThread(int coreId)
@@ -108,7 +109,7 @@ void workerThread(int coreId)
         if (currentProc)
         {
             int cmdNum = 1;
-            while (emulatorRunning && currentProc->remainingCommands > 0)
+            while (currentProc->remainingCommands > 0)
             {
                 writePrintRecord(currentProc->id, coreId, cmdNum++);
                 currentProc->remainingCommands--;
@@ -240,14 +241,6 @@ void shutdownEmulator()
 
 int main()
 {
-    std::vector<std::thread> workers; // start the worker threads 
-    for (int i = 0; i < NUM_CORES; ++i)
-    {
-        workers.emplace_back(workerThread, i);
-    }
-
-    std::thread scheduler(schedulerThread);
-
     // Create the 10 processes and push them to the ready queue
     for (int i = 1; i <= 10; ++i)
     {
@@ -257,6 +250,14 @@ int main()
         std::lock_guard<std::mutex> lock(queueMutex);
         readyQueue.push(std::make_shared<Process>(name.str(), 100));
     }
+
+    std::vector<std::thread> workers; // start the worker threads
+    for (int i = 0; i < NUM_CORES; ++i)
+    {
+        workers.emplace_back(workerThread, i);
+    }
+
+    std::thread scheduler(schedulerThread);
 
     std::cout << "> ";
     std::string input;
