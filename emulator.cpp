@@ -22,6 +22,8 @@ const bool ENABLE_PRINT_FILES = ENABLE_PRINT_FILES_FLAG;
 
  
 // TO DO: "Declare 4 cores for the CPU scheduler."
+const int NUM_CORES = 4;
+
 // TO DO: "Create 10 processes, each with 100 print commands, upon the start of your OS emulator."
 
 // timestamp used by Process and the print records, ex: 08/06/2024 09:15:22AM
@@ -68,6 +70,10 @@ std::map<std::string, std::ofstream> processFiles;  // one file per process
 std::mutex fileMutex;
 std::atomic<bool> emulatorRunning{true};            // set to false on exit
 
+// Core assignments state to manage exactly 4 worker threads
+std::vector<std::shared_ptr<Process>> coreAssignments(NUM_CORES, nullptr);
+std::mutex coreMutex;
+
 // TO DO: "Implement the "print" command with the following behavior: each process creates a text file
 // where all its associated print commands are written, with the timestamp of when it was executed by
 // the CPU and the CPU core that executed it."
@@ -82,6 +88,56 @@ void writePrintRecord(const std::string& pid, int core, int cmdNum) {
 // (e.g., 1 thread for the scheduler, 1 thread per CPU worker)"
 void workerThread(int coreId) {
     // TO DO: 1 thread per CPU worker
+    while (emulatorRunning) {
+        std::shared_ptr<Process> currentProc = nullptr;
+
+        {
+            std::unique_lock<std::mutex> lock(coreMutex);
+            queueCV.wait(lock, [coreId]() {
+                return !emulatorRunning || coreAssignments[coreId] != nullptr;
+            });
+
+            if (!emulatorRunning && coreAssignments[coreId] == nullptr) {
+                break;
+            }
+
+            currentProc = coreAssignments[coreId];
+        }
+
+        if (currentProc) {
+            int cmdNum = 1;
+            while (emulatorRunning && currentProc->remainingCommands > 0) {
+                writePrintRecord(currentProc->id, coreId, cmdNum++);
+                currentProc->remainingCommands--;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+
+            currentProc->isFinished = true;
+
+            // Remove process from runningList
+            {
+                std::lock_guard<std::mutex> lock(runningMutex);
+                for (auto it = runningList.begin(); it != runningList.end(); ++it) {
+                    if ((*it)->id == currentProc->id) {
+                        runningList.erase(it);
+                        break;
+                    }
+                }
+            }
+
+            // Move process to finishedList
+            {
+                std::lock_guard<std::mutex> lock(finishedMutex);
+                finishedList.push_back(currentProc);
+            }
+
+            // Free assigned core
+            {
+                std::lock_guard<std::mutex> lock(coreMutex);
+                coreAssignments[coreId] = nullptr;
+            }
+        }
+    }
 }
 
 void schedulerThread() {
@@ -125,6 +181,10 @@ void shutdownEmulator() {
 
 int main() {
     std::vector<std::thread> workers;   // TO DO: start the worker threads here
+    for (int i = 0; i < NUM_CORES; ++i) {
+        workers.emplace_back(workerThread, i);
+    }
+
     std::thread scheduler;              // TO DO: start the scheduler thread here
 
     // TO DO: create the 10 processes and push them to the ready queue
