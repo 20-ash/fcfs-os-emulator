@@ -14,12 +14,6 @@
 #include <sstream>
 #include <ctime>
 
-#ifndef ENABLE_PRINT_FILES_FLAG
-#define ENABLE_PRINT_FILES_FLAG 1 // 1 = homework, 0 = machine project
-#endif
-
-const bool ENABLE_PRINT_FILES = ENABLE_PRINT_FILES_FLAG;
-
 const int NUM_CORES = 4;
 
 // timestamp used by Process and the print records, ex: 08/06/2024 09:15:22AM
@@ -75,9 +69,6 @@ std::mutex coreMutex;
 
 void writePrintRecord(const std::string &pid, int core, int cmdNum)
 {
-    if (!ENABLE_PRINT_FILES)
-        return; // files disabled for the xmachine project
-
     std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"Hello world from " + pid + "!\"";
     std::lock_guard<std::mutex> lock(fileMutex);
 
