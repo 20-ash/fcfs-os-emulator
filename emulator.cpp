@@ -13,41 +13,9 @@
 #include <chrono>
 #include <sstream>
 #include <ctime>
+#include "Process.h"
 
 const int NUM_CORES = 4;
-
-// timestamp used by Process and the print records, ex: 08/06/2024 09:15:22AM
-std::string getTimestamp()
-{
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t); // windows
-#else
-    localtime_r(&t, &tm); // linux/mac
-#endif
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%m/%d/%Y %I:%M:%S%p");
-    return oss.str();
-}
-
-// Process struct (name, submit time, total commands, remaining commands, assigned core, finished flag)
-struct Process
-{
-    std::string id;
-    std::string submitTime;
-    int totalCommands;
-    std::atomic<int> remainingCommands;
-    std::atomic<int> assignedCore{-1}; // -1 = not on a core yet
-    std::atomic<bool> isFinished{false};
-
-    Process(std::string pid, int cmds)
-        : id(pid), totalCommands(cmds), remainingCommands(cmds)
-    {
-        submitTime = getTimestamp(); // time the process was created
-    }
-};
 
 std::queue<std::shared_ptr<Process>> readyQueue; // FCFS
 std::mutex queueMutex;
@@ -58,6 +26,9 @@ std::mutex runningMutex;
 std::vector<std::shared_ptr<Process>> finishedList; // processes that are done
 std::mutex finishedMutex;
 
+std::vector<std::shared_ptr<Process>> sleepingList;
+std::mutex sleepingMutex;
+
 std::condition_variable queueCV;                   // wakes up the workers; will be used when exiting
 std::map<std::string, std::ofstream> processFiles; // one file per process
 std::mutex fileMutex;
@@ -67,9 +38,9 @@ std::atomic<bool> emulatorRunning{true}; // set to false on exit
 std::vector<std::shared_ptr<Process>> coreAssignments(NUM_CORES, nullptr);
 std::mutex coreMutex;
 
-void writePrintRecord(const std::string &pid, int core, int cmdNum)
+void writePrintRecord(const std::string &pid, int core, const std::string &msg)
 {
-    std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"Hello world from " + pid + "!\"";
+    std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"" + msg + "\"";
     std::lock_guard<std::mutex> lock(fileMutex);
 
     auto it = processFiles.find(pid);
@@ -86,13 +57,100 @@ void writePrintRecord(const std::string &pid, int core, int cmdNum)
                << std::flush;
 }
 
+// declaration for executeInstructionList
+bool executeInstruction(std::shared_ptr<Process> process, int coreId, const Attributes &instruction, int depth);
+
+// runs a list of instructions sequentially for FOR
+bool executeInstructionList(std::shared_ptr<Process> proc, int coreId, const std::vector<Attributes> &list, int depth)
+{
+    for (const auto &instr : list)
+    {
+        if (!executeInstruction(proc, coreId, instr, depth))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool executeInstruction(std::shared_ptr<Process> process, int coreId, const Attributes &instruction, int depth)
+{
+    // 1 Clock tick
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    switch (instruction.type)
+    {
+    case Instruction::PRINT: // PRINT instruction
+    {
+        std::string outputString = instruction.var1; // get var1
+
+        // evaluate var2 if any
+        if (!instruction.var2.empty())
+        {
+            uint16_t val = process->evaluateArgument(instruction.var2);
+            outputString += std::to_string(val);
+        }
+
+        if (outputString.empty())
+        {
+            // default message if no arg passed
+            outputString = "Hello World from " + process->id + "!";
+        }
+        writePrintRecord(process->id, coreId, outputString);
+        break;
+    }
+    case Instruction::DECLARE:
+    {
+        // assign to symbol table var and value
+        process->setVariable(instruction.var1, process->evaluateArgument(instruction.var2));
+        break;
+    }
+    case Instruction::ADD:
+    {
+        uint16_t op1 = process->evaluateArgument(instruction.var2);
+        uint16_t op2 = process->evaluateArgument(instruction.var3);
+        process->setVariable(instruction.var1, op1 + op2); // put result to symbol table w/ name
+        break;
+    }
+    case Instruction::SUBTRACT:
+    {
+        uint16_t op1 = process->evaluateArgument(instruction.var2);
+        uint16_t op2 = process->evaluateArgument(instruction.var3);
+        process->setVariable(instruction.var1, op1 - op2);
+        break;
+    }
+    case Instruction::SLEEP:
+    {
+        process->sleepTicksRemaining = static_cast<uint8_t>(process->evaluateArgument(instruction.var1));
+        process->isSleeping = true;
+        return false;
+    }
+    case Instruction::FOR:
+    {
+        if (depth >= 3) // only 3 loops
+        {
+            // Max loop reached, stop
+            break;
+        }
+        for (uint16_t i = 0; i < instruction.value; ++i)
+        {
+            if (!executeInstructionList(process, coreId, instruction.loopedTasks, depth + 1))
+            {
+                return false;
+            }
+        }
+        break;
+    }
+    }
+    return true;
+}
+
 void workerThread(int coreId)
 {
     // 1 thread per CPU worker
     while (emulatorRunning)
     {
         std::shared_ptr<Process> currentProc = nullptr;
-
         {
             std::unique_lock<std::mutex> lock(coreMutex);
             queueCV.wait(lock, [coreId]()
@@ -108,12 +166,19 @@ void workerThread(int coreId)
 
         if (currentProc)
         {
-            int cmdNum = 1;
-            while (currentProc->remainingCommands > 0)
+            bool yielded = false;
+
+            while (currentProc->programCounter < currentProc->instructions.size())
             {
-                writePrintRecord(currentProc->id, coreId, cmdNum++);
-                currentProc->remainingCommands--;
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                const auto &instr = currentProc->instructions[currentProc->programCounter];
+                bool continueExec = executeInstruction(currentProc, coreId, instr, 0);
+
+                currentProc->programCounter++;
+                if (!continueExec) // process SLEEP
+                {
+                    yielded = true;
+                    break;
+                }
             }
 
             currentProc->isFinished = true;
@@ -121,20 +186,27 @@ void workerThread(int coreId)
             // Remove process from runningList
             {
                 std::lock_guard<std::mutex> lock(runningMutex);
-                for (auto it = runningList.begin(); it != runningList.end(); ++it)
-                {
-                    if ((*it)->id == currentProc->id)
-                    {
-                        runningList.erase(it);
-                        break;
-                    }
-                }
+                runningList.erase(
+                    std::remove(runningList.begin(), runningList.end(), currentProc),
+                    runningList.end());
             }
 
-            // Move process to finishedList
+            if (yielded)
             {
-                std::lock_guard<std::mutex> lock(finishedMutex);
-                finishedList.push_back(currentProc);
+                // yield core and place process in sleepingList
+                {
+                    std::lock_guard<std::mutex> lock(sleepingMutex);
+                    sleepingList.push_back(currentProc);
+                }
+            }
+            else
+            {
+                // process completed
+                currentProc->isFinished = true;
+                {
+                    std::lock_guard<std::mutex> lock(finishedMutex);
+                    finishedList.push_back(currentProc);
+                }
             }
 
             // Free assigned core
@@ -150,6 +222,33 @@ void schedulerThread()
 {
     while (emulatorRunning)
     {
+        // sleeping queue
+        {
+            std::lock_guard<std::mutex> sleepLock(sleepingMutex);
+            for (auto it = sleepingList.begin(); it != sleepingList.end();)
+            {
+                auto &proc = *it;
+                if (proc->sleepTicksRemaining > 0)
+                {
+                    proc->sleepTicksRemaining--;
+                }
+
+                if (proc->sleepTicksRemaining == 0)
+                {
+                    proc->isSleeping = false;
+                    {
+                        std::lock_guard<std::mutex> qLock(queueMutex);
+                        readyQueue.push(proc);
+                    }
+                    it = sleepingList.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
         std::shared_ptr<Process> currentProc = nullptr;
         int idleCore = -1;
 
@@ -195,10 +294,8 @@ void schedulerThread()
             // call other threads
             queueCV.notify_all();
         }
-        else
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 
@@ -214,7 +311,7 @@ void cmdScreenLs()
             std::cout << std::left << std::setw(10) << p->id
                       << "(" << p->submitTime << ")   "
                       << std::setw(10) << ("Core: " + std::to_string(p->assignedCore.load()))
-                      << done << " / " << p->totalCommands << "\n";
+                      << p->programCounter << " / " << p->instructions.size() << "\n";
         }
     }
     std::cout << "\nFinished processes:\n";
@@ -225,7 +322,7 @@ void cmdScreenLs()
             std::cout << std::left << std::setw(10) << p->id
                       << "(" << p->submitTime << ")   "
                       << std::setw(10) << "Finished"
-                      << p->totalCommands << " / " << p->totalCommands << "\n";
+                      << p->instructions.size() << " / " << p->instructions.size() << "\n";
         }
     }
     std::cout << "----------------------------------------\n> ";
@@ -247,8 +344,11 @@ int main()
         std::ostringstream name;
         name << "process" << std::setw(2) << std::setfill('0') << i;
 
+        auto instrs = generateSampleInstructions(i); // NOTE TO GRPMATE: this must be called in scheduler-start. For now, i put it here
+        auto proc = std::make_shared<Process>(name.str(), instrs);
+
         std::lock_guard<std::mutex> lock(queueMutex);
-        readyQueue.push(std::make_shared<Process>(name.str(), 100));
+        readyQueue.push(proc);
     }
 
     std::vector<std::thread> workers; // start the worker threads
