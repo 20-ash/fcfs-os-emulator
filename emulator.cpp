@@ -299,33 +299,60 @@ void schedulerThread()
     }
 }
 
-void cmdScreenLs()
+// NOTE TO GRPMATE DOING SCREEN COMMANDS (?): incomplete details to show pa, check specs nalang
+std::string generateSystemReport()
 {
-    std::cout << "----------------------------------------\n";
-    std::cout << "Running processes:\n";
+    std::ostringstream oss;
+
+    oss << "----------------------------------------\n";
+    oss << "Running processes:\n";
     {
         std::lock_guard<std::mutex> lock(runningMutex);
         for (auto &p : runningList)
         {
             int done = p->totalCommands - p->remainingCommands;
-            std::cout << std::left << std::setw(10) << p->id
-                      << "(" << p->submitTime << ")   "
-                      << std::setw(10) << ("Core: " + std::to_string(p->assignedCore.load()))
-                      << p->programCounter << " / " << p->instructions.size() << "\n";
+            oss << std::left << std::setw(10) << p->id
+                << "(" << p->submitTime << ")   "
+                << std::setw(10) << ("Core: " + std::to_string(p->assignedCore.load()))
+                << p->programCounter << " / " << p->instructions.size() << "\n";
         }
     }
-    std::cout << "\nFinished processes:\n";
+    oss << "\nFinished processes:\n";
     {
         std::lock_guard<std::mutex> lock(finishedMutex);
         for (auto &p : finishedList)
         {
-            std::cout << std::left << std::setw(10) << p->id
-                      << "(" << p->submitTime << ")   "
-                      << std::setw(10) << "Finished"
-                      << p->instructions.size() << " / " << p->instructions.size() << "\n";
+            oss << std::left << std::setw(10) << p->id
+                << "(" << p->submitTime << ")   "
+                << std::setw(10) << "Finished"
+                << p->instructions.size() << " / " << p->instructions.size() << "\n";
         }
     }
-    std::cout << "----------------------------------------\n> ";
+    oss << "----------------------------------------\n ";
+
+    return oss.str();
+}
+
+void cmdScreenLs()
+{
+    std::cout << generateSystemReport() << "> ";
+}
+
+void cmdReportUtil()
+{
+    std::string report = generateSystemReport();
+    std::ofstream outFile("csopesy-log.txt", std::ios::out | std::ios::trunc);
+
+    if (outFile.is_open())
+    {
+        outFile << report;
+        outFile.close();
+        std::cout << "Report generated at csopesy-log.txt!\n> ";
+    }
+    else
+    {
+        std::cout << "Failed to generate report file.\n> ";
+    }
 }
 
 // "Type "exit" to close your emulator."
@@ -367,6 +394,10 @@ int main()
         {
             cmdScreenLs();
         }
+        else if (input == "report-util")
+        {
+            cmdReportUtil();
+        }
         else if (input == "exit")
         {
             shutdownEmulator();
@@ -374,7 +405,7 @@ int main()
         }
         else
         {
-            std::cout << "Available commands: screen -ls | exit\n> ";
+            std::cout << "Available commands: screen -ls | report-util | exit ";
         }
     }
 
