@@ -15,9 +15,13 @@
 #include <sstream>
 #include <ctime>
 #include <random>
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <unordered_map>
 
 // timestamp used by Process and the print records, ex: 08/06/2024 09:15:22AM
-std::string getTimestamp()
+inline std::string getTimestamp()
 {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -58,23 +62,30 @@ struct Process
 {
     std::string id;
     std::string submitTime;
-    int totalCommands;
-    std::atomic<int> remainingCommands;
-    std::atomic<int> assignedCore{-1}; // -1 = not on a core yet
+     
+    uint64_t totalCommands = 0;
+    std::atomic<uint64_t> remainingCommands{0};
+    std::atomic<int> assignedCore{-1};
     std::atomic<bool> isFinished{false};
     std::atomic<bool> isSleeping{false};
-    uint8_t sleepTicksRemaining = 0;
+    std::atomic<uint8_t> sleepTicksRemaining{0};
 
-    // Symbol table
     std::unordered_map<std::string, uint16_t> variables;
 
     std::vector<Attributes> instructions;
-    size_t programCounter = 0;
+    std::atomic<size_t> programCounter{0};
+
+    // PRINT logs accessible through process-smi
+    std::vector<std::string> logs;
+    std::mutex logsMutex;
 
     Process(std::string pid, std::vector<Attributes> instructionsList = {})
         : id(pid), instructions(std::move(instructionsList))
     {
-        submitTime = getTimestamp(); // time the process was created
+        submitTime = getTimestamp(); // record submission time
+
+        totalCommands = instructions.size(); // set total commands
+        remainingCommands = totalCommands;  // set remaining commands
     }
 
     uint16_t evaluateArgument(const std::string &arg)
@@ -83,11 +94,12 @@ struct Process
         if (arg.empty())
             return 0;
 
-        // If integer
-        if (std::all_of(arg.begin(), arg.end(), ::isdigit))
+        // if arg is a number, return its value
+        if (std::all_of(arg.begin(), arg.end(), [](unsigned char c)
+                { return std::isdigit(c); }))
         {
-            unsigned long val = std::stoul(arg);                  // convert string to long
-            return static_cast<uint16_t>(std::min(val, 65535UL)); // clamp
+            unsigned long val = std::stoul(arg);
+            return static_cast<uint16_t>(std::min(val, 65535UL));
         }
 
         // automatically declare as 0 if missing in symbol table
@@ -118,7 +130,7 @@ struct Process
 };
 
 // gen instructions for sample processes
-std::vector<Attributes> generateSampleInstructions(int offset)
+inline std::vector<Attributes> generateSampleInstructions(int offset, uint64_t numInstruction)
 {
     // randomized seed
     std::mt19937 rng(std::random_device{}() + offset);
@@ -127,7 +139,7 @@ std::vector<Attributes> generateSampleInstructions(int offset)
     std::uniform_int_distribution<int> valDist(1, 100); // Value range
     std::uniform_int_distribution<int> sleepDist(1, 5); // Sleep ticks
     std::uniform_int_distribution<int> loopDist(2, 4);  // Loop repeats
-    std::uniform_int_distribution<int> lenDist(5, 10);  // Instructions count
+    
 
     std::vector<std::string> varNames = {"x", "y", "z", "counter"};
     auto getRandomVar = [&](std::mt19937 &gen)
@@ -137,9 +149,9 @@ std::vector<Attributes> generateSampleInstructions(int offset)
     };
 
     std::vector<Attributes> instrs;
-    int numInstructions = lenDist(rng);
+    uint64_t numInstructions = numInstruction; 
 
-    for (int i = 0; i < numInstructions; ++i)
+    for (uint64_t i = 0; i < numInstructions; ++i)
     {
         int opChoice = opDist(rng);
 
