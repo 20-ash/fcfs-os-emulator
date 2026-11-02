@@ -13,9 +13,13 @@
 #include <chrono>
 #include <sstream>
 #include <ctime>
+#include <algorithm>
+#include <unordered_map>
+#include <cstdint>
+#include <limits>
 #include "Process.h"
+#include "Config.h"
 
-const int NUM_CORES = 4;
 
 std::queue<std::shared_ptr<Process>> readyQueue; // FCFS
 std::mutex queueMutex;
@@ -35,8 +39,21 @@ std::mutex fileMutex;
 std::atomic<bool> emulatorRunning{true}; // set to false on exit
 
 // Core assignments state to manage exactly 4 worker threads
-std::vector<std::shared_ptr<Process>> coreAssignments(NUM_CORES, nullptr);
+std::vector<std::shared_ptr<Process>> coreAssignments;
 std::mutex coreMutex;
+
+const std::string PROMPT = "root:\\> ";
+
+Config config;
+std::atomic<bool> initialized{false};
+std::atomic<bool> generatingProcesses{false};
+std::atomic<uint64_t> cpuCycles{0};
+std::atomic<uint64_t> frameCounter{0};
+std::atomic<int> processCounter{0};
+std::atomic<uint64_t> nextProcessTick{0};
+
+std::vector<std::thread> workers;
+std::thread schedulerThreadHandle;
 
 void writePrintRecord(const std::string &pid, int core, const std::string &msg)
 {
@@ -75,8 +92,12 @@ bool executeInstructionList(std::shared_ptr<Process> proc, int coreId, const std
 
 bool executeInstruction(std::shared_ptr<Process> process, int coreId, const Attributes &instruction, int depth)
 {
-    // 1 Clock tick
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // 1 Clock tick; wait for the next CPU frame pass
+    uint64_t startTick = frameCounter.load();
+    while (frameCounter.load() == startTick && emulatorRunning)
+    {
+        std::this_thread::yield();
+    }
 
     switch (instruction.type)
     {
@@ -123,6 +144,7 @@ bool executeInstruction(std::shared_ptr<Process> process, int coreId, const Attr
     {
         process->sleepTicksRemaining = static_cast<uint8_t>(process->evaluateArgument(instruction.var1));
         process->isSleeping = true;
+        process->remainingCommands--;
         return false;
     }
     case Instruction::FOR:
@@ -142,7 +164,42 @@ bool executeInstruction(std::shared_ptr<Process> process, int coreId, const Attr
         break;
     }
     }
+
+    process->remainingCommands--;
+    
     return true;
+}
+
+
+void cpuTickThread()
+{
+    while (emulatorRunning)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        uint64_t tick = ++cpuCycles;
+        frameCounter = tick;
+
+        // scheduler-start batch generation: every config.batchProcessFreq ticks
+        if (generatingProcesses && config.batchProcessFreq > 0 &&
+            tick >= nextProcessTick)
+        {
+            nextProcessTick = tick + config.batchProcessFreq;
+            ++processCounter;
+            std::ostringstream name;
+            name << "p" << std::setw(2) << std::setfill('0') << processCounter.load();
+
+            auto instrs = generateSampleInstructions(processCounter.load());
+            auto proc = std::make_shared<Process>(name.str(), instrs);
+            proc->totalCommands = static_cast<int>(instrs.size());
+            proc->remainingCommands = proc->totalCommands;
+
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                readyQueue.push(proc);
+            }
+            queueCV.notify_all();
+        }
+    }
 }
 
 void workerThread(int coreId)
@@ -167,6 +224,8 @@ void workerThread(int coreId)
         if (currentProc)
         {
             bool yielded = false;
+            bool isSleep = false;
+            uint64_t quantumUsed = 0;
 
             while (currentProc->programCounter < currentProc->instructions.size())
             {
@@ -174,14 +233,31 @@ void workerThread(int coreId)
                 bool continueExec = executeInstruction(currentProc, coreId, instr, 0);
 
                 currentProc->programCounter++;
-                if (!continueExec) // process SLEEP
+                ++quantumUsed;
+
+                if (!continueExec) // SLEEP was executed
+                {
+                    yielded = true;
+                    isSleep = true;
+                    break;
+                }
+
+                // RR: preempt if quantum exhausted
+                if (config.scheduler == "rr" && quantumUsed >= config.quantumCycles)
                 {
                     yielded = true;
                     break;
                 }
             }
 
-            currentProc->isFinished = true;
+            // Only mark finished if the program counter actually reached the end
+            bool reallyFinished =
+                (currentProc->programCounter >= currentProc->instructions.size());
+
+            if (reallyFinished)
+            {
+                currentProc->isFinished = true;
+            }
 
             // Remove process from runningList
             {
@@ -191,22 +267,22 @@ void workerThread(int coreId)
                     runningList.end());
             }
 
-            if (yielded)
+            if (isSleep)
             {
-                // yield core and place process in sleepingList
-                {
-                    std::lock_guard<std::mutex> lock(sleepingMutex);
-                    sleepingList.push_back(currentProc);
-                }
+                std::lock_guard<std::mutex> lock(sleepingMutex);
+                sleepingList.push_back(currentProc);
+            }
+            else if (reallyFinished)
+            {
+                std::lock_guard<std::mutex> lock(finishedMutex);
+                finishedList.push_back(currentProc);
             }
             else
             {
-                // process completed
-                currentProc->isFinished = true;
-                {
-                    std::lock_guard<std::mutex> lock(finishedMutex);
-                    finishedList.push_back(currentProc);
-                }
+                // RR quantum preemption: back to ready queue
+                std::lock_guard<std::mutex> lock(queueMutex);
+                readyQueue.push(currentProc);
+                queueCV.notify_all();
             }
 
             // Free assigned core
@@ -214,6 +290,7 @@ void workerThread(int coreId)
                 std::lock_guard<std::mutex> lock(coreMutex);
                 coreAssignments[coreId] = nullptr;
             }
+            queueCV.notify_all();
         }
     }
 }
@@ -262,7 +339,7 @@ void schedulerThread()
             // check if core i is available
             if (!readyQueue.empty())
             {
-                for (int i = 0; i < NUM_CORES; ++i)
+                for (int i = 0; i < static_cast<int>(coreAssignments.size()); ++i)
                 {
                     if (coreAssignments[i] == nullptr)
                     {
@@ -299,18 +376,29 @@ void schedulerThread()
     }
 }
 
-// NOTE TO GRPMATE DOING SCREEN COMMANDS (?): incomplete details to show pa, check specs nalang
 std::string generateSystemReport()
 {
     std::ostringstream oss;
 
+    int coresUsed = 0;
+    int coresTotal = 0;
+    {
+        std::lock_guard<std::mutex> lock(coreMutex);
+        coresTotal = static_cast<int>(coreAssignments.size());
+        for (auto &c : coreAssignments)
+            if (c != nullptr) ++coresUsed;
+    }
+    int utilization = (coresTotal > 0) ? (coresUsed * 100 / coresTotal) : 0;
+
+    oss << "CPU utilization: " << utilization << "%\n";
+    oss << "Cores used: " << coresUsed << "\n";
+    oss << "Cores available: " << (coresTotal - coresUsed) << "\n";
     oss << "----------------------------------------\n";
     oss << "Running processes:\n";
     {
         std::lock_guard<std::mutex> lock(runningMutex);
         for (auto &p : runningList)
         {
-            int done = p->totalCommands - p->remainingCommands;
             oss << std::left << std::setw(10) << p->id
                 << "(" << p->submitTime << ")   "
                 << std::setw(10) << ("Core: " + std::to_string(p->assignedCore.load()))
@@ -328,14 +416,13 @@ std::string generateSystemReport()
                 << p->instructions.size() << " / " << p->instructions.size() << "\n";
         }
     }
-    oss << "----------------------------------------\n ";
-
+    oss << "----------------------------------------\n";
     return oss.str();
 }
 
 void cmdScreenLs()
 {
-    std::cout << generateSystemReport() << "> ";
+    std::cout << generateSystemReport() << PROMPT;
 }
 
 void cmdReportUtil()
@@ -347,11 +434,11 @@ void cmdReportUtil()
     {
         outFile << report;
         outFile.close();
-        std::cout << "Report generated at csopesy-log.txt!\n> ";
+        std::cout << "Report generated at csopesy-log.txt!\n> " << PROMPT;
     }
     else
     {
-        std::cout << "Failed to generate report file.\n> ";
+        std::cout << "Failed to generate report file.\n> " << PROMPT;
     }
 }
 
@@ -365,38 +452,92 @@ void shutdownEmulator()
 
 int main()
 {
-    // Create the 10 processes and push them to the ready queue
-    for (int i = 1; i <= 10; ++i)
-    {
-        std::ostringstream name;
-        name << "process" << std::setw(2) << std::setfill('0') << i;
+    
 
-        auto instrs = generateSampleInstructions(i); // NOTE TO GRPMATE: this must be called in scheduler-start. For now, i put it here
-        auto proc = std::make_shared<Process>(name.str(), instrs);
-
-        std::lock_guard<std::mutex> lock(queueMutex);
-        readyQueue.push(proc);
-    }
-
-    std::vector<std::thread> workers; // start the worker threads
-    for (int i = 0; i < NUM_CORES; ++i)
-    {
-        workers.emplace_back(workerThread, i);
-    }
-
-    std::thread scheduler(schedulerThread);
+    std::cout << "Welcome to CSOPESY Emulator!\n";
+    std::cout << "Developers:\n Bactong, Gabrielle Joei V.\n Lee, Ashley Fiona S. \n Lobo, Shirley Marie A. \n Roldan, Beatrice C.";
+    std::cout << "Last updated: 11-02-2026\n\n";
 
     std::cout << "> ";
     std::string input;
     while (emulatorRunning && std::getline(std::cin, input))
     {
-        if (input == "screen -ls")
+        if (!initialized && input != "initialize" && input != "exit")
+        {
+            std::cout << "Please run 'initialize' first.\n> ";
+        }
+        else if (input == "initialize")
+        {
+            std::string err;
+            if (!loadConfig("config.txt", config, err))
+            {
+                std::cout << "Config error: " << err << "\n> ";
+            }
+            else
+            {
+                if (workers.empty())
+                {
+                    coreAssignments.assign(config.numCpu, nullptr);
+                    for (uint64_t i = 0; i < config.numCpu; ++i)
+                        workers.emplace_back(workerThread, static_cast<int>(i));
+
+                    schedulerThreadHandle = std::thread(schedulerThread);
+                    std::thread(cpuTickThread).detach();
+                }
+
+                initialized = true;
+                std::cout << "Initialized with " << config.numCpu << " cores.\n> ";
+            }
+        }
+        else if (input == "scheduler-start")
+        {
+            if (!initialized) {
+                std::cout << "Please run 'initialize' first.\n> ";
+            } else {
+                generatingProcesses = true;
+                nextProcessTick = cpuCycles.load() + config.batchProcessFreq;
+                std::cout << "Scheduler started.\n> ";
+            }
+        }
+        else if (input == "scheduler-stop")
+        {
+            generatingProcesses = false;
+            std::cout << "Scheduler stopped.\n> ";
+        }
+        else if (input == "screen -ls")
         {
             cmdScreenLs();
         }
         else if (input == "report-util")
         {
             cmdReportUtil();
+        }
+        else if (input.rfind("screen -s ", 0) == 0)
+        {
+            std::string pname = input.substr(10);
+            if (pname.empty()) {
+                std::cout << "Usage: screen -s <process name>\n> ";
+            } else {
+                std::cout << "Attached to screen of " << pname << "\n> ";
+            }
+        }
+        else if (input.rfind("screen -r ", 0) == 0)
+        {
+            std::string pname = input.substr(10);
+            if (pname.empty()) {
+                std::cout << "Usage: screen -r <process name>\n> ";
+            } else {
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lock(runningMutex);
+                    for (auto &p : runningList)
+                        if (p->id == pname) { found = true; break; }
+                }
+                if (found)
+                    std::cout << "Resumed screen of " << pname << "\n> ";
+                else
+                    std::cout << "Process " << pname << " not found.\n> ";
+            }
         }
         else if (input == "exit")
         {
@@ -405,7 +546,7 @@ int main()
         }
         else
         {
-            std::cout << "Available commands: screen -ls | report-util | exit ";
+            std::cout << "Available commands: initialize | screen -s <name> | screen -r <name> | screen -ls | scheduler-start | scheduler-stop | report-util | exit\n> ";
         }
     }
 
@@ -415,8 +556,8 @@ int main()
     for (auto &t : workers)
         if (t.joinable())
             t.join();
-    if (scheduler.joinable())
-        scheduler.join();
+    if (schedulerThreadHandle.joinable())
+        schedulerThreadHandle.join();
 
     // close the files only after the threads are done
     {
