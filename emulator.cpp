@@ -641,16 +641,24 @@ int main()
         else if (input.rfind("screen -s ", 0) == 0)
         {
             std::string pname = input.substr(10);
+
             if (pname.empty()) {
                 std::cout << "Usage: screen -s <process name>\n> ";
             } else {
-                std::lock_guard<std::mutex> lock(runningMutex);
-                auto it = std::find_if(runningList.begin(), runningList.end(),
-                                        [&pname](const std::shared_ptr<Process> &p) {
-                                            return p->id == pname;
-                                        });
-                if (it != runningList.end()) {
-                    attachProcessScreen(*it);
+                std::shared_ptr<Process> process = nullptr;
+
+                {
+                    std::lock_guard<std::mutex> lock(allProcessesMutex);
+
+                    auto it = allProcesses.find(pname);
+
+                    if (it != allProcesses.end()) {
+                        process = it->second;
+                    }
+                }
+
+                if (process != nullptr) {
+                    attachProcessScreen(process);
                 } else {
                     std::cout << "Process " << pname << " not found.\n> ";
                 }
@@ -658,20 +666,28 @@ int main()
         }
         else if (input.rfind("screen -r ", 0) == 0)
         {
-            std::string pname = input.substr(10);
-            if (pname.empty()) {
+            std::string pname = input.substr(10); // Extract process name after "screen -r "
+
+            if (pname.empty()) {     // Check if process name is empty
                 std::cout << "Usage: screen -r <process name>\n> ";
             } else {
-                bool found = false;
-                {
-                    std::lock_guard<std::mutex> lock(runningMutex);
-                    for (auto &p : runningList)
-                        if (p->id == pname) { found = true; break; }
+                std::shared_ptr<Process> process = nullptr;
+
+                { // Lock the allProcessesMutex to safely access the allProcesses map
+                    std::lock_guard<std::mutex> lock(allProcessesMutex);
+
+                    auto it = allProcesses.find(pname);
+
+                    if (it != allProcesses.end()) {
+                        process = it->second;
+                    }
                 }
-                if (found)
-                    std::cout << "Resumed screen of " << pname << "\n> ";
-                else
+
+                if (process != nullptr) {
+                    attachProcessScreen(process);
+                } else {
                     std::cout << "Process " << pname << " not found.\n> ";
+                }
             }
         }
         else if (input == "exit")
