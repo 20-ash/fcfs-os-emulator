@@ -63,7 +63,7 @@ std::thread cpuTickThreadHandle;
 
 void writePrintRecord(std::shared_ptr<Process> process, int core, const std::string &msg)
 {
-    std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"" + msg + "\"";
+    /*std::string line = "(" + getTimestamp() + ") Core:" + std::to_string(core) + " \"" + msg + "\"";
 
     {
         std::lock_guard<std::mutex> lock(process->logsMutex);
@@ -86,6 +86,7 @@ void writePrintRecord(std::shared_ptr<Process> process, int core, const std::str
     }
 
     it->second << line << "\n" << std::flush;
+    */
 }
 
 // declaration for executeInstructionList
@@ -131,7 +132,7 @@ bool executeInstruction(std::shared_ptr<Process> process, int coreId, const Attr
             // default message if no arg passed
             outputString = "Hello World from " + process->id + "!";
         }
-         writePrintRecord(process, coreId, outputString);
+        writePrintRecord(process, coreId, outputString);
         break;
     }
     case Instruction::DECLARE:
