@@ -517,7 +517,7 @@ void attachProcessScreen(std::shared_ptr<Process> process)
     std::cout << "\nAttached to process: " << process->id << "\n";
     std::cout << "Enter 'process-smi' to view process information or 'exit' to return.\n";
 
-    while (emulatorRunning && !process->isFinished)
+    while (emulatorRunning)
     {
         std::cout << process->id << "> ";
 
@@ -642,25 +642,51 @@ int main()
         {
             std::string pname = input.substr(10);
 
-            if (pname.empty()) {
-                std::cout << "Usage: screen -s <process name>\n> ";
-            } else {
-                std::shared_ptr<Process> process = nullptr;
+            if (pname.empty()){ std::cout << "Usage: screen -s <process name>\n> ";}
+            else
+            {
+                bool exists = false;
 
+                // Check if the process name is already taken
                 {
                     std::lock_guard<std::mutex> lock(allProcessesMutex);
-
-                    auto it = allProcesses.find(pname);
-
-                    if (it != allProcesses.end()) {
-                        process = it->second;
-                    }
+                    exists = (allProcesses.find(pname) != allProcesses.end());
                 }
 
-                if (process != nullptr) {
+                if (exists){ std::cout << "Process " << pname << " already exists.\n> "; }
+                else
+                {
+                    //Generate the number of instructions using config.txt
+                    int processNumber = ++processCounter;
+
+                    std::mt19937 rng(std::random_device{}() + processNumber);
+                    std::uniform_int_distribution<uint64_t> insDist(
+                        config.minIns, config.maxIns);
+
+                    uint64_t numInstructions = insDist(rng);
+
+                    //Create the process using the name entered by the user
+                    auto instrs = generateSampleInstructions(processNumber, numInstructions);
+                    auto process = std::make_shared<Process>(pname, instrs);
+
+                    //Store the process in allProcesses
+                    {
+                        std::lock_guard<std::mutex> lock(allProcessesMutex);
+                        allProcesses[pname] = process;
+                    }
+
+                    //Add the process to the ready queue
+                    {
+                        std::lock_guard<std::mutex> lock(queueMutex);
+                        readyQueue.push(process);
+                    }
+
+                    queueCV.notify_all();
+
+                    std::cout << "Process " << pname << " created successfully.\n";
+
+                    // Open the newly created process screen
                     attachProcessScreen(process);
-                } else {
-                    std::cout << "Process " << pname << " not found.\n> ";
                 }
             }
         }
