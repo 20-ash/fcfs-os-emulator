@@ -531,39 +531,13 @@ void attachProcessScreen(std::shared_ptr<Process> process)
         }
         else if (command == "process-smi")
         {
+            // Display process information
             std::cout << "\nProcess name: " << process->id << "\n";
-            std::cout << "ID: " << process->id << "\n";
-            std::cout << "Current instruction: "
-                      << process->programCounter.load()
-                      << " / " << process->instructions.size() << "\n";
-            std::cout << "Remaining instructions: "
-                      << process->remainingCommands.load() << "\n";
-
-            if (process->assignedCore.load() >= 0)
-                std::cout << "Assigned core: " << process->assignedCore.load() << "\n";
-            else
-                std::cout << "Assigned core: None\n";
-
-            std::cout << "\nLogs:\n";
-
-            {
-                std::lock_guard<std::mutex> lock(process->logsMutex);
-
-                if (process->logs.empty())
-                {
-                    std::cout << "No logs yet.\n";
-                }
-                else
-                {
-                    for (const auto &log : process->logs)
-                        std::cout << log << "\n";
-                }
-            }
-
-            if (process->isFinished)
-                std::cout << "\nFinished!\n";
-
-            std::cout << "\n";
+            std::cout << "Current instruction line: "
+                    << std::min(process->programCounter.load(),
+                                process->instructions.size()) << "\n";
+            std::cout << "Total lines of code: "
+                    << process->instructions.size() << "\n\n";
         }
         else
         {
